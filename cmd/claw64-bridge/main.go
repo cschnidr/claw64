@@ -60,10 +60,12 @@ type CLI struct {
 	SerialAddr  string `name:"serial-addr" help:"Serial TCP address VICE connects to. Defaults to the worktree .ports file when present."`
 	SerialPort  string `name:"serial-port" help:"Real serial device path, for example /dev/cu.C64. Implies --spawn-vice=false."`
 	MonitorAddr string `name:"monitor-addr" help:"VICE remote monitor address. Defaults to the worktree .ports file when present."`
-	LLM         string `name:"llm" default:"openai" enum:"anthropic,openai,ollama" help:"LLM backend."`
+	LLM         string `name:"llm" default:"openai" enum:"anthropic,openai,ollama,bedrock" help:"LLM backend."`
 	Model       string `name:"model" help:"Override the LLM model name."`
 	LLMURL      string `name:"llm-url" help:"Override the OpenAI/Ollama-compatible endpoint URL."`
 	LLMKey      string `name:"llm-key" help:"API key for direct API backends."`
+	AWSRegion   string `name:"aws-region" help:"AWS region for Bedrock (required when --llm=bedrock)."`
+	AWSProfile  string `name:"aws-profile" help:"AWS named profile for Bedrock credentials."`
 	SpawnVICE   bool   `name:"spawn-vice" default:"true" help:"Spawn VICE automatically."`
 	ViceBin     string `name:"vice-bin" default:"x64sc" help:"VICE binary to launch when spawning."`
 	ViceConsole bool   `name:"vice-console" help:"Start VICE in console mode for headless burn-in runs."`
@@ -218,6 +220,13 @@ func newLLM(cfg CLI) (llm.Completer, string) {
 		}
 		return &llm.OpenAIClient{URL: url, Model: model},
 			fmt.Sprintf("ollama url=%s model=%s", url, model)
+
+	case "bedrock":
+		if cfg.AWSRegion == "" {
+			log.Fatalf("--aws-region is required when --llm=bedrock")
+		}
+		c := llm.NewBedrock(cfg.AWSRegion, cfg.AWSProfile, cfg.Model)
+		return c, fmt.Sprintf("bedrock region=%s model=%s", c.Region, c.Model)
 	}
 
 	log.Fatalf("unknown LLM backend: %q", cfg.LLM)

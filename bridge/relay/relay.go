@@ -1017,9 +1017,16 @@ func (r *Relay) callAndDispatch(ctx context.Context, userID string) (bool, error
 
 	// Tools are sequential here. The C64 is stateful, so each tool result
 	// must feed the next model decision before another tool is dispatched.
+	// Some backends (Bedrock) require a tool_result for every tool_use in a
+	// response, so we strip the extras from history entirely. The model will
+	// only see that one tool was called and one result came back.
 	tc := resp.ToolCalls[0]
 	if len(resp.ToolCalls) > 1 {
 		log.Printf("%s", flowLine("", "→", "LLM", "request", fmt.Sprintf("extra tool calls ignored in this turn (%d total)", len(resp.ToolCalls))))
+		// Rewrite history: keep only the first tool call in the assistant message.
+		trimmed := resp
+		trimmed.ToolCalls = []llm.ToolCall{tc}
+		r.History.ReplaceLast(userID, trimmed)
 	}
 	r.lastToolCallID = tc.ID
 	r.lastToolName = tc.Function.Name

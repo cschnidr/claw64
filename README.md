@@ -445,7 +445,35 @@ wire logs.
 |---------|---------|------|
 | OpenAI / Codex | `openai` (default) | `OPENAI_API_KEY`, `--llm-key`, or Codex/ChatGPT OAuth |
 | Anthropic (API) | `anthropic` | `ANTHROPIC_API_KEY`, `--llm-key`, or `auth set-key` |
+| AWS Bedrock | `bedrock` | AWS credential chain (env, shared config, SSO, IAM role) |
 | Ollama | `ollama` | none needed |
+
+### AWS Bedrock
+
+Uses the [Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-call.html)
+via the AWS SDK for Go v2. Authentication uses the standard AWS credential
+provider chain: environment variables, shared credentials/config files, SSO,
+ECS task roles, EC2 instance metadata, and web identity tokens.
+
+```bash
+# Minimal: region + default credentials
+go run ./cmd/claw64-bridge --llm bedrock --aws-region us-east-1 stdin
+
+# Named profile
+go run ./cmd/claw64-bridge --llm bedrock --aws-region us-east-1 --aws-profile myprofile stdin
+
+# Cross-region inference profile (recommended for higher throughput)
+go run ./cmd/claw64-bridge --llm bedrock --aws-region us-east-1 \
+    --model us.anthropic.claude-sonnet-4-5-20250929-v1:0 stdin
+
+# EU cross-region inference
+go run ./cmd/claw64-bridge --llm bedrock --aws-region eu-west-1 \
+    --model eu.anthropic.claude-sonnet-4-5-20250929-v1:0 stdin
+```
+
+The `--aws-region` flag is required when using Bedrock. The default model is
+`us.anthropic.claude-sonnet-4-5-20250929-v1:0` (US cross-region Claude Sonnet 4.5).
+Pass any Bedrock model ID or inference profile ID via `--model`.
 
 ## Status
 
