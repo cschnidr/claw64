@@ -33,6 +33,7 @@ type Relay struct {
 	DebugDir         string
 	MonitorAddr      string
 	SymbolPath       string
+	CompactLog       bool      // condensed human-friendly log output
 	StreamOut        io.Writer // streaming progress output (default: os.Stderr)
 	SystemPrompt     string    // received from C64
 	promptChunks     map[int]string
@@ -76,8 +77,15 @@ type Relay struct {
 	overflowWaiters  []chan struct{}
 	msgRetryBase     time.Duration
 	msgRetryMax      time.Duration
-	DeliveryRetry    func(name string, attempt int, err error)
-	C64Duplicate     func(name string, id byte, newest byte)
+
+	// compact-log tracking state
+	compactSystemBytes int    // accumulated SYSTEM prompt bytes
+	compactTextBytes   int    // accumulated TEXT bytes sent
+	compactTextChunks  int    // number of TEXT chunks sent
+	compactExecCmd     string // pending EXEC command awaiting STATUS
+
+	DeliveryRetry func(name string, attempt int, err error)
+	C64Duplicate  func(name string, id byte, newest byte)
 }
 
 type recvResult struct {
@@ -322,7 +330,12 @@ func (r *Relay) handleSystemFrame(f serial.Frame) {
 		r.promptChunks = make(map[int]string)
 	}
 	r.promptChunks[idx] = text
-	log.Printf("%s", flowLine("LLM", "←", "C64", "SYSTEM", fmt.Sprintf("chunk [%d/%d] %d bytes", idx+1, total, len(text))))
+
+	if r.CompactLog {
+		r.compactSystemBytes += len(text)
+	} else {
+		log.Printf("%s", flowLine("LLM", "←", "C64", "SYSTEM", fmt.Sprintf("chunk [%d/%d] %d bytes", idx+1, total, len(text))))
+	}
 
 	if len(r.promptChunks) == total {
 		var prompt string
@@ -331,7 +344,13 @@ func (r *Relay) handleSystemFrame(f serial.Frame) {
 		}
 		r.SystemPrompt = prompt
 		r.promptChunks = nil
-		log.Printf("%s", flowLine("LLM", "←", "C64", "SYSTEM", fmt.Sprintf("received (%d bytes)", len(prompt))))
+
+		if r.CompactLog {
+			r.compactLogOK("recv", "C64", fmt.Sprintf("SYSTEM prompt (%d bytes)", r.compactSystemBytes))
+			r.compactSystemBytes = 0
+		} else {
+			log.Printf("%s", flowLine("LLM", "←", "C64", "SYSTEM", fmt.Sprintf("received (%d bytes)", len(prompt))))
+		}
 	}
 }
 
@@ -409,6 +428,11 @@ func logErrorf(format string, args ...any) {
 // SetupProgress installs a send-progress callback on the serial link
 // that prints payload bytes char-by-char as they are sent.
 func (r *Relay) SetupProgress() {
+	// In compact mode, suppress char-by-char streaming output entirely.
+	if r.CompactLog {
+		return
+	}
+
 	w := r.streamOut()
 
 	r.Link.OnSendByte = func(typeName string, payload []byte, idx int) {
@@ -565,6 +589,14 @@ func (r *Relay) HandleMessageStream(ctx context.Context, userID string, text str
 }
 
 func (r *Relay) sendMSG(ctx context.Context, msgFrame serial.Frame) error {
+	if r.CompactLog {
+		// Compact mode: emit one line after delivery confirmed.
+		err := r.sendVerifiedWithTimeout(ctx, msgFrame, "MSG", msgAdmissionAckTimeout)
+		if err == nil {
+			r.compactLogOK("send", "C64", fmt.Sprintf("MSG %q", truncate(string(msgFrame.Payload), 40)))
+		}
+		return err
+	}
 	logStream(r.streamOut(), "%s ", flowLabel("USER", "→", "C64", "MSG"))
 	return r.sendVerifiedWithTimeout(ctx, msgFrame, "MSG", msgAdmissionAckTimeout)
 }
@@ -584,6 +616,13 @@ func (r *Relay) waitForOverlapQueueRoom(ctx context.Context) error {
 }
 
 func (r *Relay) sendOverlappingMSG(ctx context.Context, msgFrame serial.Frame) error {
+	if r.CompactLog {
+		err := r.sendVerifiedWithAckWaiter(ctx, msgFrame, "MSG", msgAdmissionAckTimeout)
+		if err == nil {
+			r.compactLogOK("send", "C64", fmt.Sprintf("MSG %q", truncate(string(msgFrame.Payload), 40)))
+		}
+		return err
+	}
 	logStream(r.streamOut(), "%s ", flowLabel("USER", "→", "C64", "MSG"))
 	return r.sendVerifiedWithAckWaiter(ctx, msgFrame, "MSG", msgAdmissionAckTimeout)
 }
@@ -663,11 +702,13 @@ func (r *Relay) eventLoop(ctx context.Context, userID string, emit func(string) 
 		// Post-unwrap semantic log — clean payload after id strip.
 		// SYSTEM is streamed during receive; the other frame types are
 		// logged only after full decode/unwrap.
-		if f.Type == serial.FrameLLM {
-			log.Printf("%s", flowLine("LLM", "←", "C64", "EVENT", formatC64LLMEvent(f.Payload)))
-		}
-		if f.Type == serial.FrameUser {
-			log.Printf("%s", flowLine("USER", "←", "C64", "TEXT", fmt.Sprintf("len=%d text=%q", len(f.Payload), truncate(string(f.Payload), 60))))
+		if !r.CompactLog {
+			if f.Type == serial.FrameLLM {
+				log.Printf("%s", flowLine("LLM", "←", "C64", "EVENT", formatC64LLMEvent(f.Payload)))
+			}
+			if f.Type == serial.FrameUser {
+				log.Printf("%s", flowLine("USER", "←", "C64", "TEXT", fmt.Sprintf("len=%d text=%q", len(f.Payload), truncate(string(f.Payload), 60))))
+			}
 		}
 		if deliveredUserText && r.hasQueuedMessageWaiter() && shouldHandOffSemanticFrameAfterUserText(f.Type) {
 			r.pendingFrames = append([]queuedFrame{{frame: f, accepted: accepted}}, r.pendingFrames...)
@@ -676,7 +717,9 @@ func (r *Relay) eventLoop(ctx context.Context, userID string, emit func(string) 
 
 		switch f.Type {
 		case serial.FrameLLM:
-			fmt.Fprintln(r.streamOut()) // newline after streamed payload
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut()) // newline after streamed payload
+			}
 			payloads := [][]byte{append([]byte(nil), f.Payload...)}
 			payloads = append(payloads, r.drainTrailingLLMMessages()...)
 			r.appendC64LLMEvents(userID, payloads)
@@ -690,7 +733,9 @@ func (r *Relay) eventLoop(ctx context.Context, userID string, emit func(string) 
 			}
 
 		case serial.FrameResult:
-			fmt.Fprintln(r.streamOut()) // newline after streamed payload
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut()) // newline after streamed payload
+			}
 			r.toolInFlight = nil
 			r.waitingTool = false
 			r.basicRunning = false
@@ -699,6 +744,11 @@ func (r *Relay) eventLoop(ctx context.Context, userID string, emit func(string) 
 			resultText, complete := r.handleResultFrame(f)
 			if !complete {
 				continue
+			}
+
+			// Compact log: emit one-line RESULT summary.
+			if r.CompactLog {
+				r.compactLog("recv", "C64", fmt.Sprintf("RESULT (%d bytes)", len(resultText)))
 			}
 
 			resultPrefix := toolResultScreenPrefix
@@ -720,7 +770,9 @@ func (r *Relay) eventLoop(ctx context.Context, userID string, emit func(string) 
 			}
 
 		case serial.FrameStatus:
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			r.toolInFlight = nil
 			r.waitingTool = false
 			status := string(f.Payload)
@@ -738,11 +790,22 @@ func (r *Relay) eventLoop(ctx context.Context, userID string, emit func(string) 
 				r.textDrainPending = true
 			}
 
-			if isExpectedStatus(status) {
-				log.Printf("%s", flowLine("LLM", "←", "C64", "STATUS!", status))
+			if r.CompactLog {
+				// In compact mode, emit EXEC line with status now that we know the result.
+				if r.compactExecCmd != "" {
+					r.compactLog("send", "C64", fmt.Sprintf("EXEC %q \u2192 %s", truncate(r.compactExecCmd, 40), status))
+					r.compactExecCmd = ""
+				}
+				if !isExpectedStatus(status) {
+					r.dumpMalformedStatus(status, f.Payload)
+				}
 			} else {
-				log.Printf("%s", flowLine("LLM", "←", "C64", "STATUS!", fmt.Sprintf("%s payload=%s", status, hex.EncodeToString(f.Payload))))
-				r.dumpMalformedStatus(status, f.Payload)
+				if isExpectedStatus(status) {
+					log.Printf("%s", flowLine("LLM", "←", "C64", "STATUS!", status))
+				} else {
+					log.Printf("%s", flowLine("LLM", "←", "C64", "STATUS!", fmt.Sprintf("%s payload=%s", status, hex.EncodeToString(f.Payload))))
+					r.dumpMalformedStatus(status, f.Payload)
+				}
 			}
 			r.appendToolResult(userID, toolResultStatusPrefix+status)
 			idle, err := r.callAndDispatch(ctx, userID)
@@ -755,7 +818,13 @@ func (r *Relay) eventLoop(ctx context.Context, userID string, emit func(string) 
 			}
 
 		case serial.FrameError:
-			log.Printf("%s", flowLine("LLM", "←", "C64", "ERROR", "timeout"))
+			if r.CompactLog {
+				r.compactError("← C64  ERROR: timeout")
+				// Clear pending EXEC if any.
+				r.compactExecCmd = ""
+			} else {
+				log.Printf("%s", flowLine("LLM", "←", "C64", "ERROR", "timeout"))
+			}
 			r.toolInFlight = nil
 			r.waitingTool = false
 			r.basicRunning = false
@@ -776,28 +845,40 @@ func (r *Relay) eventLoop(ctx context.Context, userID string, emit func(string) 
 			// C64 finishes this burst, then return it to the chat frontend.
 			// Drain any immediately trailing internal frames first so the
 			// next user turn does not start by consuming stale ACK/STATUS.
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			r.textBuf = append(r.textBuf, f.Payload...)
 			r.drainTrailingAfterUserText()
 			text := string(r.textBuf)
 			r.textBuf = nil
 			deliveredUserText = true
+
+			if r.CompactLog {
+				r.compactLog("send", "C64", fmt.Sprintf("TEXT (%d bytes) \u2192 user", len(text)))
+			}
 			if err := emit(text); err != nil {
 				return err
 			}
 			continue
 
 		case serial.FrameSystem:
-			fmt.Fprintln(r.streamOut()) // newline after streamed payload
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut()) // newline after streamed payload
+			}
 			r.handleSystemFrame(f)
 			continue
 
 		case serial.FrameAck:
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			if ackID, ok := serial.ExtractAckID(f.Payload); ok && r.consumeLateAck(ackID) {
 				continue
 			}
-			logWarnf("%s", flowLine("", "←", "C64", "ACK", "unexpected"))
+			if !r.CompactLog {
+				logWarnf("%s", flowLine("", "←", "C64", "ACK", "unexpected"))
+			}
 			continue
 
 		default:
@@ -885,10 +966,14 @@ func (r *Relay) drainTrailingAfterUserText() {
 
 		switch f.Type {
 		case serial.FrameUser:
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			r.textBuf = append(r.textBuf, f.Payload...)
 		case serial.FrameSystem:
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			r.handleSystemFrame(f)
 		default:
 			r.pendingFrames = append(r.pendingFrames, queuedFrame{frame: f, accepted: accepted})
@@ -915,11 +1000,15 @@ func (r *Relay) drainTrailingLLMMessages() [][]byte {
 
 		switch f.Type {
 		case serial.FrameLLM:
-			fmt.Fprintln(r.streamOut())
-			log.Printf("%s", flowLine("LLM", "←", "C64", "EVENT", formatC64LLMEvent(f.Payload)))
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+				log.Printf("%s", flowLine("LLM", "←", "C64", "EVENT", formatC64LLMEvent(f.Payload)))
+			}
 			payloads = append(payloads, append([]byte(nil), f.Payload...))
 		case serial.FrameSystem:
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			r.handleSystemFrame(f)
 		default:
 			r.pendingFrames = append(r.pendingFrames, queuedFrame{frame: f, accepted: accepted})
@@ -999,9 +1088,11 @@ func (r *Relay) callAndDispatch(ctx context.Context, userID string) (bool, error
 	// protocols; the C64 remains the user-facing agent.
 	if len(resp.ToolCalls) == 0 {
 		if resp.Content == "" {
-			log.Printf("%s", flowLine("LLM", "←", "", "response", "silent completion"))
-			logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "DONE"))
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				log.Printf("%s", flowLine("LLM", "←", "", "response", "silent completion"))
+				logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "DONE"))
+				fmt.Fprintln(r.streamOut())
+			}
 			doneFrame := serial.Frame{Type: serial.FrameDone}
 			if err := r.sendVerified(ctx, doneFrame, "DONE"); err != nil {
 				return false, fmt.Errorf("send DONE: %w", err)
@@ -1009,6 +1100,9 @@ func (r *Relay) callAndDispatch(ctx context.Context, userID string) (bool, error
 			return true, nil
 		}
 
+		if r.CompactLog {
+			r.compactLog("recv", "LLM", fmt.Sprintf("TEXT (%d bytes)", len(resp.Content)))
+		}
 		r.History.Append(userID, resp)
 		r.textOutQueue = []byte(serial.ToC64Text(resp.Content))
 		return false, r.sendNextTextChunk(ctx)
@@ -1022,7 +1116,9 @@ func (r *Relay) callAndDispatch(ctx context.Context, userID string) (bool, error
 	// only see that one tool was called and one result came back.
 	tc := resp.ToolCalls[0]
 	if len(resp.ToolCalls) > 1 {
-		log.Printf("%s", flowLine("", "→", "LLM", "request", fmt.Sprintf("extra tool calls ignored in this turn (%d total)", len(resp.ToolCalls))))
+		if !r.CompactLog {
+			log.Printf("%s", flowLine("", "→", "LLM", "request", fmt.Sprintf("extra tool calls ignored in this turn (%d total)", len(resp.ToolCalls))))
+		}
 		// Rewrite history: keep only the first tool call in the assistant message.
 		trimmed := resp
 		trimmed.ToolCalls = []llm.ToolCall{tc}
@@ -1051,14 +1147,23 @@ func (r *Relay) callAndDispatch(ctx context.Context, userID string) (bool, error
 		if len(cmd) > bridgeFrameBodyMax {
 			cmd = cmd[:bridgeFrameBodyMax]
 		}
-		logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "EXEC"))
+		if r.CompactLog {
+			r.compactLog("recv", "LLM", fmt.Sprintf("exec(%q)", truncate(cmd, 40)))
+			r.compactExecCmd = cmd
+		} else {
+			logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "EXEC"))
+		}
 		if err := r.sendExec(ctx, []byte(cmd)); err != nil {
 			return false, fmt.Errorf("send EXEC: %w", err)
 		}
 
 	case "screen":
-		logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "SCREENSHOT"))
-		fmt.Fprintln(r.streamOut())
+		if r.CompactLog {
+			r.compactLog("recv", "LLM", "screen()")
+		} else {
+			logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "SCREENSHOT"))
+			fmt.Fprintln(r.streamOut())
+		}
 		screenFrame := serial.Frame{Type: serial.FrameScreenshot}
 		if err := r.sendVerifiedOrSemantic(ctx, screenFrame, "SCREENSHOT"); err != nil {
 			return false, fmt.Errorf("send SCREENSHOT: %w", err)
@@ -1067,8 +1172,12 @@ func (r *Relay) callAndDispatch(ctx context.Context, userID string) (bool, error
 		r.startToolWait()
 
 	case "stop":
-		logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "STOP"))
-		fmt.Fprintln(r.streamOut())
+		if r.CompactLog {
+			r.compactLog("recv", "LLM", "stop()")
+		} else {
+			logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "STOP"))
+			fmt.Fprintln(r.streamOut())
+		}
 		stopFrame := serial.Frame{Type: serial.FrameStop}
 		if err := r.sendVerifiedOrSemantic(ctx, stopFrame, "STOP"); err != nil {
 			return false, fmt.Errorf("send STOP: %w", err)
@@ -1077,8 +1186,12 @@ func (r *Relay) callAndDispatch(ctx context.Context, userID string) (bool, error
 		r.startToolWait()
 
 	case "status":
-		logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "STATUS?"))
-		fmt.Fprintln(r.streamOut())
+		if r.CompactLog {
+			r.compactLog("recv", "LLM", "status()")
+		} else {
+			logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "STATUS?"))
+			fmt.Fprintln(r.streamOut())
+		}
 		if r.basicRunning {
 			timer := time.NewTimer(runningStatusPollInterval)
 			select {
@@ -1105,6 +1218,18 @@ func (r *Relay) callAndDispatch(ctx context.Context, userID string) (bool, error
 }
 
 func (r *Relay) logLLMRequest(messages []llm.Message, tools []llm.Tool) {
+	if r.CompactLog {
+		if d, ok := r.LLM.(llm.RequestDescriber); ok {
+			url, _, err := d.DescribeRequest(messages, tools)
+			if err == nil {
+				r.compactLog("send", "LLM", url+" ...")
+				return
+			}
+		}
+		r.compactLog("send", "LLM", "...")
+		return
+	}
+
 	if d, ok := r.LLM.(llm.RequestDescriber); ok {
 		url, body, err := d.DescribeRequest(messages, tools)
 		if err != nil {
@@ -1121,16 +1246,25 @@ func (r *Relay) logLLMRequest(messages []llm.Message, tools []llm.Tool) {
 }
 
 func (r *Relay) sendNextTextChunk(ctx context.Context) error {
+	if r.CompactLog {
+		// Reset compact text tracking at start of a new TEXT sequence.
+		r.compactTextBytes = 0
+		r.compactTextChunks = 0
+	}
 	for len(r.textOutQueue) > 0 {
 		// Completion drain: hold TEXT while C64 is draining RESULT/STATUS.
 		if r.completionDrain {
-			log.Printf("%s", flowLine("", "→", "C64", "TEXT", fmt.Sprintf("queued (%d bytes), waiting for completion drain", len(r.textOutQueue))))
+			if !r.CompactLog {
+				log.Printf("%s", flowLine("", "→", "C64", "TEXT", fmt.Sprintf("queued (%d bytes), waiting for completion drain", len(r.textOutQueue))))
+			}
 			return nil
 		}
-		if r.textDrainPending {
-			log.Printf("%s", flowLine("", "→", "C64", "TEXT", fmt.Sprintf("queued (%d bytes), draining C64 transport", len(r.textOutQueue))))
-		} else {
-			log.Printf("%s", flowLine("", "→", "C64", "TEXT", fmt.Sprintf("queued (%d bytes), waiting for C64 transport quiet", len(r.textOutQueue))))
+		if !r.CompactLog {
+			if r.textDrainPending {
+				log.Printf("%s", flowLine("", "→", "C64", "TEXT", fmt.Sprintf("queued (%d bytes), draining C64 transport", len(r.textOutQueue))))
+			} else {
+				log.Printf("%s", flowLine("", "→", "C64", "TEXT", fmt.Sprintf("queued (%d bytes), waiting for C64 transport quiet", len(r.textOutQueue))))
+			}
 		}
 		if err := r.drainC64OutboundBeforeText(ctx); err != nil {
 			return err
@@ -1143,10 +1277,22 @@ func (r *Relay) sendNextTextChunk(ctx context.Context) error {
 		r.textOutQueue = r.textOutQueue[len(chunk):]
 		r.textInFlight = append(r.textInFlight[:0], chunk...)
 		if err := r.sendTextChunk(ctx, chunk); err != nil {
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			return fmt.Errorf("send TEXT: %w", err)
 		}
 		r.textInFlight = r.textInFlight[:0]
+
+		if r.CompactLog {
+			r.compactTextBytes += len(chunk)
+			r.compactTextChunks++
+		}
+	}
+
+	// Compact mode: emit one consolidated TEXT line after all chunks are sent.
+	if r.CompactLog && r.compactTextChunks > 0 {
+		r.compactLogOK("send", "C64", fmt.Sprintf("TEXT (%d bytes, %d chunks)", r.compactTextBytes, r.compactTextChunks))
 	}
 	return nil
 }
@@ -1191,7 +1337,9 @@ func (r *Relay) drainC64OutboundBeforeText(ctx context.Context) error {
 func (r *Relay) sendTextChunk(ctx context.Context, chunk []byte) error {
 	frame := serial.Frame{Type: serial.FrameText, Payload: chunk}
 	retryDelays := reliableRetryDelays
-	logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "TEXT"))
+	if !r.CompactLog {
+		logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "TEXT"))
+	}
 	id, frame, err := r.sendNewReliableBridgeFrame(frame)
 	if err != nil {
 		return err
@@ -1199,7 +1347,9 @@ func (r *Relay) sendTextChunk(ctx context.Context, chunk []byte) error {
 
 	for attempt := 0; attempt < len(retryDelays); attempt++ {
 		if attempt > 0 {
-			logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "TEXT"))
+			if !r.CompactLog {
+				logStream(r.streamOut(), "%s ", flowLabel("LLM", "→", "C64", "TEXT"))
+			}
 			if err := r.resendReliableBridgeFrame(frame); err != nil {
 				return err
 			}
@@ -1234,7 +1384,9 @@ func (r *Relay) sendExec(ctx context.Context, cmd []byte) error {
 	if err := r.sendVerifiedOrSemanticWith(ctx, execFrame, "EXEC", execAckTimeoutFor(len(cmd)), execRetryDelays); err != nil {
 		return err
 	}
-	fmt.Fprintln(r.streamOut())
+	if !r.CompactLog {
+		fmt.Fprintln(r.streamOut())
+	}
 
 	r.toolInFlight = append(r.toolInFlight[:0], cmd...)
 	r.startToolWait()
@@ -1326,7 +1478,9 @@ func (r *Relay) waitForAckWaiter(ctx context.Context, waiter <-chan serial.Frame
 			if !ok || ackID != id {
 				continue
 			}
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			return nil
 		}
 	}
@@ -1560,12 +1714,16 @@ func (r *Relay) acceptC64FrameWith(f *serial.Frame, ackNow bool, flush bool) boo
 	}
 	f.Payload = body
 	if id == r.rxLastID && f.Type == r.rxLastType {
-		log.Printf("%s", flowLine("", "←", "C64", "dedup", fmt.Sprintf("type=%s id=%d", serial.TypeName(f.Type), id)))
+		if !r.CompactLog {
+			log.Printf("%s", flowLine("", "←", "C64", "dedup", fmt.Sprintf("type=%s id=%d", serial.TypeName(f.Type), id)))
+		}
 		r.noteC64Duplicate(f.Type, id, r.rxLastID)
 		return true
 	}
 	if r.rxLastID != 0 && !transportIDAhead(id, r.rxLastID) {
-		log.Printf("%s", flowLine("", "←", "C64", "dedup", fmt.Sprintf("stale type=%s id=%d newest=%d", serial.TypeName(f.Type), id, r.rxLastID)))
+		if !r.CompactLog {
+			log.Printf("%s", flowLine("", "←", "C64", "dedup", fmt.Sprintf("stale type=%s id=%d newest=%d", serial.TypeName(f.Type), id, r.rxLastID)))
+		}
 		r.noteC64Duplicate(f.Type, id, r.rxLastID)
 		return true
 	}
@@ -1632,7 +1790,9 @@ func (r *Relay) flushPendingAcksLocked() {
 
 	sent := false
 	for _, id := range r.pendingAcks {
-		log.Printf("%s", flowLine("", "→", "C64", "ACK", fmt.Sprintf("id=%d", id)))
+		if !r.CompactLog {
+			log.Printf("%s", flowLine("", "→", "C64", "ACK", fmt.Sprintf("id=%d", id)))
+		}
 		ack := serial.Frame{Type: serial.FrameAckToC64, Payload: ackToC64Payload(id)}
 		if err := r.Link.Send(ack); err != nil {
 			logErrorf("     ! failed to send ACK(%d) to C64: %v", id, err)
@@ -1696,7 +1856,9 @@ func (r *Relay) waitForAckID(ctx context.Context, id byte, waitingTextAck bool) 
 		}
 		switch f.Type {
 		case serial.FrameAck:
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			ackID, ok := serial.ExtractAckID(f.Payload)
 			if waitingTextAck {
 				r.noteTextAckFrame(fmt.Sprintf("ACK id=%d", ackID))
@@ -1770,7 +1932,9 @@ func (r *Relay) waitForAckOrSemantic(ctx context.Context, id byte, timeout time.
 
 		switch f.Type {
 		case serial.FrameAck:
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			ackID, ok := serial.ExtractAckID(f.Payload)
 			if ok && ackID == id {
 				if requiresSemanticConfirmation(name) {
@@ -1788,7 +1952,9 @@ func (r *Relay) waitForAckOrSemantic(ctx context.Context, id byte, timeout time.
 				continue
 			}
 			deadline = time.Now().Add(timeout)
-			fmt.Fprintln(r.streamOut())
+			if !r.CompactLog {
+				fmt.Fprintln(r.streamOut())
+			}
 			r.pendingFrames = append(r.pendingFrames, queuedFrame{frame: f, accepted: true})
 		case serial.FrameStatus, serial.FrameResult, serial.FrameError, serial.FrameLLM:
 			if r.acceptC64FrameQueued(&f, true) {
