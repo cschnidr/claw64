@@ -1017,9 +1017,18 @@ func (r *Relay) callAndDispatch(ctx context.Context, userID string) (bool, error
 
 	// Tools are sequential here. The C64 is stateful, so each tool result
 	// must feed the next model decision before another tool is dispatched.
+	// Some backends (Bedrock) require a tool_result for every tool_use in a
+	// response, so we immediately cancel the extra ones.
 	tc := resp.ToolCalls[0]
 	if len(resp.ToolCalls) > 1 {
 		log.Printf("%s", flowLine("", "→", "LLM", "request", fmt.Sprintf("extra tool calls ignored in this turn (%d total)", len(resp.ToolCalls))))
+		for _, extra := range resp.ToolCalls[1:] {
+			r.History.Append(userID, llm.Message{
+				Role:       "tool",
+				Content:    "ERROR: only one tool call per turn is supported",
+				ToolCallID: extra.ID,
+			})
+		}
 	}
 	r.lastToolCallID = tc.ID
 	r.lastToolName = tc.Function.Name
