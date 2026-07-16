@@ -34,6 +34,18 @@ func (h *History) Get(userID string) []llm.Message {
 	return out
 }
 
+// ReplaceLast overwrites the most recent message in a user's history.
+func (h *History) ReplaceLast(userID string, msg llm.Message) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	msgs := h.convs[userID]
+	if len(msgs) == 0 {
+		h.convs[userID] = []llm.Message{msg}
+		return
+	}
+	msgs[len(msgs)-1] = msg
+}
+
 // Clear removes all messages for a user.
 func (h *History) Clear(userID string) {
 	h.mu.Lock()
