@@ -68,6 +68,7 @@ type CLI struct {
 	ViceBin     string `name:"vice-bin" default:"x64sc" help:"VICE binary to launch when spawning."`
 	ViceConsole bool   `name:"vice-console" help:"Start VICE in console mode for headless burn-in runs."`
 	LoaderPRG   string `name:"loader-prg" help:"Override the embedded loader PRG path."`
+	CompactLog  bool   `name:"compact-log" help:"Use condensed human-friendly log output."`
 	Say         bool   `name:"say" help:"Speak every outgoing backend message with macOS say -v Zarvox."`
 
 	Stdin      StdinCmd      `cmd:"" help:"Chat in the local terminal."`
@@ -245,6 +246,7 @@ func runChatBridge(cfg CLI, ch chat.Channel) {
 		Link:        link,
 		LLM:         llmClient,
 		History:     relay.NewHistory(),
+		CompactLog:  cfg.CompactLog,
 		DebugDir:    "debug",
 		MonitorAddr: cfg.MonitorAddr,
 		SymbolPath:  defaultSymbolPath(),
