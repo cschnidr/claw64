@@ -92,6 +92,11 @@ func (c *BedrockClient) buildInput(messages []Message, tools []Tool) (*bedrockru
 	var system []types.SystemContentBlock
 	var convMsgs []types.Message
 
+	// Track tool_use IDs from the last assistant message so we can validate
+	// that tool results match. Bedrock strictly requires that every toolResult
+	// corresponds to a toolUse in the immediately preceding assistant turn.
+	var lastAssistantToolIDs map[string]bool
+
 	for _, m := range messages {
 		switch {
 		case m.Role == "system":
@@ -102,7 +107,9 @@ func (c *BedrockClient) buildInput(messages []Message, tools []Tool) (*bedrockru
 			if m.Content != "" {
 				blocks = append(blocks, &types.ContentBlockMemberText{Value: m.Content})
 			}
+			lastAssistantToolIDs = make(map[string]bool)
 			for _, tc := range m.ToolCalls {
+				lastAssistantToolIDs[tc.ID] = true
 				input, err := jsonToBedrockDoc(tc.Function.Arguments)
 				if err != nil {
 					return nil, fmt.Errorf("tool call input: %w", err)
@@ -121,21 +128,32 @@ func (c *BedrockClient) buildInput(messages []Message, tools []Tool) (*bedrockru
 			})
 
 		case m.Role == "tool":
-			// Tool results are sent as user messages with ToolResult content blocks.
-			block := &types.ContentBlockMemberToolResult{
-				Value: types.ToolResultBlock{
-					ToolUseId: aws.String(m.ToolCallID),
-					Content: []types.ToolResultContentBlock{
-						&types.ToolResultContentBlockMemberText{Value: m.Content},
+			// Only emit as ToolResult if the ID matches a tool_use from the
+			// last assistant message. Otherwise convert to plain user text.
+			if lastAssistantToolIDs[m.ToolCallID] {
+				delete(lastAssistantToolIDs, m.ToolCallID)
+				block := &types.ContentBlockMemberToolResult{
+					Value: types.ToolResultBlock{
+						ToolUseId: aws.String(m.ToolCallID),
+						Content: []types.ToolResultContentBlock{
+							&types.ToolResultContentBlockMemberText{Value: m.Content},
+						},
 					},
-				},
+				}
+				convMsgs = append(convMsgs, types.Message{
+					Role:    types.ConversationRoleUser,
+					Content: []types.ContentBlock{block},
+				})
+			} else {
+				// Orphaned tool result: present as plain user context.
+				convMsgs = append(convMsgs, types.Message{
+					Role:    types.ConversationRoleUser,
+					Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: m.Content}},
+				})
 			}
-			convMsgs = append(convMsgs, types.Message{
-				Role:    types.ConversationRoleUser,
-				Content: []types.ContentBlock{block},
-			})
 
 		case m.Role == "assistant":
+			lastAssistantToolIDs = nil
 			convMsgs = append(convMsgs, types.Message{
 				Role:    types.ConversationRoleAssistant,
 				Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: m.Content}},
@@ -143,6 +161,7 @@ func (c *BedrockClient) buildInput(messages []Message, tools []Tool) (*bedrockru
 
 		default:
 			// user or any other role
+			lastAssistantToolIDs = nil
 			convMsgs = append(convMsgs, types.Message{
 				Role:    types.ConversationRoleUser,
 				Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: m.Content}},
@@ -152,7 +171,7 @@ func (c *BedrockClient) buildInput(messages []Message, tools []Tool) (*bedrockru
 
 	input := &bedrockruntime.ConverseInput{
 		ModelId:  aws.String(c.Model),
-		Messages: convMsgs,
+		Messages: mergeConsecutiveRoles(convMsgs),
 	}
 	if len(system) > 0 {
 		input.System = system
@@ -263,4 +282,21 @@ func toolParamsToBedrockDoc(params Parameters) document.Interface {
 		schema["required"] = req
 	}
 	return document.NewLazyDocument(schema)
+}
+
+// mergeConsecutiveRoles merges consecutive messages with the same role into
+// a single message. Bedrock requires strictly alternating user/assistant turns.
+func mergeConsecutiveRoles(msgs []types.Message) []types.Message {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	var merged []types.Message
+	for _, m := range msgs {
+		if len(merged) > 0 && merged[len(merged)-1].Role == m.Role {
+			merged[len(merged)-1].Content = append(merged[len(merged)-1].Content, m.Content...)
+		} else {
+			merged = append(merged, m)
+		}
+	}
+	return merged
 }
